@@ -30,20 +30,23 @@ export async function GET(
   try {
     const workspacePath = process.env.WORKSPACE_PATH || ''
     const dbPath = path.join(workspacePath, params.id, 'state.vscdb')
+    const globalDbPath = path.join(workspacePath, '..', 'globalStorage', 'state.vscdb')
 
     const db = await open({
       filename: dbPath,
       driver: sqlite3.Database
     })
 
-    const chatResult = await db.get(`
-      SELECT value FROM ItemTable
-      WHERE [key] = 'workbench.panel.aichat.view.aichat.chatdata'
-    `)
-
+    // Primero intentamos con la clave del composer
     const composerResult = await db.get(`
       SELECT value FROM ItemTable
       WHERE [key] = 'composer.composerData'
+    `)
+
+    // Si no hay datos del composer, intentamos con la vista de chat
+    const chatResult = await db.get(`
+      SELECT value FROM ItemTable
+      WHERE [key] = 'workbench.panel.composerChatViewPane'
     `)
 
     await db.close()
@@ -54,37 +57,74 @@ export async function GET(
 
     const response: { tabs: ChatTab[], composers?: ComposerData } = { tabs: [] }
 
-    if (chatResult) {
-      const chatData = JSON.parse(chatResult.value)
-      response.tabs = chatData.tabs.map((tab: RawTab) => ({
-        id: tab.tabId,
-        title: tab.chatTitle?.split('\n')[0] || `Chat ${tab.tabId.slice(0, 8)}`,
-        timestamp: safeParseTimestamp(tab.lastSendTime),
-        bubbles: tab.bubbles
-      }))
+    if (composerResult) {
+      try {
+        const composerData = JSON.parse(composerResult.value)
+        console.log('Composer data:', composerData)
+        
+        if (composerData.allComposers?.length > 0) {
+          // Abrir la base de datos global para obtener los datos de conversación
+          const globalDb = await open({
+            filename: globalDbPath,
+            driver: sqlite3.Database
+          })
+
+          const composerIds = composerData.allComposers.map((c: any) => c.composerId)
+          const placeholders = composerIds.map(() => '?').join(',')
+          const keys = composerIds.map((id: string) => `composerData:${id}`)
+
+          console.log('Searching for composer keys:', keys)
+
+          const conversationsResult = await globalDb.all(`
+            SELECT key, value FROM cursorDiskKV
+            WHERE key IN (${placeholders})
+          `, keys)
+
+          await globalDb.close()
+
+          console.log('Found conversations:', conversationsResult)
+
+          if (conversationsResult?.length > 0) {
+            const conversationsMap = new Map(
+              conversationsResult.map(row => [
+                row.key.replace('composerData:', ''),
+                JSON.parse(row.value)
+              ])
+            )
+
+            response.tabs = composerData.allComposers
+              .filter((composer: any) => conversationsMap.has(composer.composerId))
+              .map((composer: any) => {
+                const conversation = conversationsMap.get(composer.composerId)
+                return {
+                  id: composer.composerId,
+                  title: composer.name || `Chat ${composer.composerId.slice(0, 8)}`,
+                  timestamp: new Date(composer.lastUpdatedAt).toISOString(),
+                  bubbles: conversation.conversation || []
+                }
+              })
+          }
+        }
+      } catch (error) {
+        console.error('Error processing composer data:', error)
+      }
     }
 
-    if (composerResult) {
-      const globalDbPath = path.join(workspacePath, '..', 'globalStorage', 'state.vscdb')
-      const composers: ComposerData = JSON.parse(composerResult.value)
-      const keys = composers.allComposers.map((it) => `composerData:${it.composerId}`)
-      const placeholders = keys.map(() => '?').join(',')
-
-      const globalDb = await open({
-        filename: globalDbPath,
-        driver: sqlite3.Database
-      })
-
-      const composersBodyResult = await globalDb.all(`
-        SELECT value FROM cursorDiskKV
-        WHERE [key] in (${placeholders})
-      `, keys)
-
-      await globalDb.close()
-
-      if (composersBodyResult) {
-        composers.allComposers = composersBodyResult.map((it) => JSON.parse(it.value))
-        response.composers = composers
+    if (chatResult && response.tabs.length === 0) {
+      try {
+        const chatData = JSON.parse(chatResult.value)
+        console.log('Chat data:', chatData)
+        
+        if (chatData['workbench.panel.aichat.view'] && chatData['workbench.panel.aichat.view'].tabs) {
+          response.tabs = chatData['workbench.panel.aichat.view'].tabs.map((tab: RawTab) => ({
+            id: tab.tabId,
+            title: tab.chatTitle?.split('\n')[0] || `Chat ${tab.tabId.slice(0, 8)}`,
+            timestamp: safeParseTimestamp(tab.lastSendTime),
+            bubbles: tab.bubbles
+          }))
+        }
+      } catch (error) {
+        console.error('Error parsing chat data:', error)
       }
     }
 
