@@ -55,12 +55,11 @@ export async function GET(
       return NextResponse.json({ error: 'No chat data found' }, { status: 404 })
     }
 
-    const response: { tabs: ChatTab[], composers?: ComposerData } = { tabs: [] }
+    const response: { tabs: ChatTab[] } = { tabs: [] }
 
     if (composerResult) {
       try {
         const composerData = JSON.parse(composerResult.value)
-        console.log('Composer data:', composerData)
         
         if (composerData.allComposers?.length > 0) {
           // Abrir la base de datos global para obtener los datos de conversación
@@ -73,16 +72,12 @@ export async function GET(
           const placeholders = composerIds.map(() => '?').join(',')
           const keys = composerIds.map((id: string) => `composerData:${id}`)
 
-          console.log('Searching for composer keys:', keys)
-
           const conversationsResult = await globalDb.all(`
             SELECT key, value FROM cursorDiskKV
             WHERE key IN (${placeholders})
           `, keys)
 
           await globalDb.close()
-
-          console.log('Found conversations:', conversationsResult)
 
           if (conversationsResult?.length > 0) {
             const conversationsMap = new Map(
@@ -93,14 +88,26 @@ export async function GET(
             )
 
             response.tabs = composerData.allComposers
-              .filter((composer: any) => conversationsMap.has(composer.composerId))
+              .filter((composer: any) => {
+                const conversation = conversationsMap.get(composer.composerId)
+                return conversation && Array.isArray(conversation.conversation)
+              })
               .map((composer: any) => {
                 const conversation = conversationsMap.get(composer.composerId)
+                const timestamp = composer.lastUpdatedAt || composer.createdAt || Date.now()
+                
+                const bubbles = conversation.conversation.map((msg: any) => ({
+                  type: msg.type === 1 ? 'user' : 'ai',
+                  text: msg.text || msg.richText || '',
+                  modelType: msg.type === 2 ? 'gpt-4' : undefined,
+                  selections: msg.context?.selections || []
+                }))
+
                 return {
                   id: composer.composerId,
                   title: composer.name || `Chat ${composer.composerId.slice(0, 8)}`,
-                  timestamp: new Date(composer.lastUpdatedAt).toISOString(),
-                  bubbles: conversation.conversation || []
+                  timestamp: new Date(timestamp).toISOString(),
+                  bubbles
                 }
               })
           }
@@ -113,15 +120,16 @@ export async function GET(
     if (chatResult && response.tabs.length === 0) {
       try {
         const chatData = JSON.parse(chatResult.value)
-        console.log('Chat data:', chatData)
         
-        if (chatData['workbench.panel.aichat.view'] && chatData['workbench.panel.aichat.view'].tabs) {
-          response.tabs = chatData['workbench.panel.aichat.view'].tabs.map((tab: RawTab) => ({
-            id: tab.tabId,
-            title: tab.chatTitle?.split('\n')[0] || `Chat ${tab.tabId.slice(0, 8)}`,
-            timestamp: safeParseTimestamp(tab.lastSendTime),
-            bubbles: tab.bubbles
-          }))
+        if (chatData['workbench.panel.aichat.view']?.tabs) {
+          response.tabs = chatData['workbench.panel.aichat.view'].tabs
+            .filter((tab: any) => tab.bubbles && Array.isArray(tab.bubbles))
+            .map((tab: any) => ({
+              id: tab.tabId,
+              title: tab.chatTitle?.split('\n')[0] || `Chat ${tab.tabId.slice(0, 8)}`,
+              timestamp: safeParseTimestamp(tab.lastSendTime),
+              bubbles: tab.bubbles
+            }))
         }
       } catch (error) {
         console.error('Error parsing chat data:', error)
